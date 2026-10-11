@@ -8,16 +8,32 @@ date: 2026-10-11
 FastAPI proof of concept in `backend/` that serves the audit contract 1.0.0 (`POST /v1/audit`) through a staged pipeline: prep, atomize, link, check, assemble. Source: [brainstorm.md](brainstorm.md). Governing scope: `docs/mission.md` (wins on conflict). Locked overrides from dev-design are listed below and win over the brainstorm.
 
 ## Sub-projects
-| # | Sub-project | Depends on | PRD | Phase |
-|---|---|---|---|---|
-| 01 | Scaffold + API | none | [PRD](01-scaffold-api/PRD.md) | Foundation |
-| 02 | Assembler + contract enforcement | 01 | [PRD](02-assembler/PRD.md) | Core stage |
-| 03 | Prep + Atomize | 01 | [PRD](03-prep-atomize/PRD.md) | Core stage |
-| 04 | Link | 01, 02, 03 | [PRD](04-link/PRD.md) | Core stage |
-| 05 | Check | 02, 03, 04 | [PRD](05-check/PRD.md) | Core stage |
-| 06 | Orchestration + latency | 01, 02, 03, 04, 05 | [PRD](06-orchestration/PRD.md) | Integration |
-| 07 | Eval data + harness | 01, 02 (harness); 03-05 (Linked mode); 06 (end-to-end) | [PRD](07-eval/PRD.md) | Validation |
-| 08 | Docs update | 01-07 | [PRD](08-docs-update/PRD.md) | Docs (last) |
+| # | Sub-project | Depends on | PRD | Phase | Core / Optional |
+|---|---|---|---|---|---|
+| 01 | Scaffold + API | none | [PRD](01-scaffold-api/PRD.md) | Foundation | Core (optional: streaming cap, metrics depth, Server-Timing, multi-breakpoint cache) |
+| 02 | Assembler + contract enforcement | 01 | [PRD](02-assembler/PRD.md) | Core stage | Core (optional: 8-gram copy check, partial-overlap trim) |
+| 03 | Prep + Atomize | 01 | [PRD](03-prep-atomize/PRD.md) | Core stage | Core (optional: LLM act tagging, leak CI test, soft-timeout path) |
+| 04 | Link | 01, 02, 03 | [PRD](04-link/PRD.md) | Core stage | Core (optional: speaker floor, correction pull, RRF fusion, recall hook, cache tuning, leak test) |
+| 05 | Check | 02, 03, 04 | [PRD](05-check/PRD.md) | Core stage | Core (optional: timeframe check, calibration, rate-ratio, cue refinements, leak tests) |
+| 06 | Orchestration + latency | 01, 02, 03, 04, 05 | [PRD](06-orchestration/PRD.md) | Integration | Core (optional: prompt caching/warm-up, latency suite, rich metrics, Server-Timing, priority) |
+| 07a | Fixtures + smoke script | 01 (smoke script needs 06) | [PRD](07-eval/PRD.md) | Validation | Core |
+| 07b | Eval harness | 01, 02 (harness); 03-05 (Linked mode); 06 (end-to-end) | [PRD](07-eval/PRD.md) | Validation | Optional (gated) |
+| 08 | Docs update | 01-07 | [PRD](08-docs-update/PRD.md) | Docs (last) | Core (optional: ADRs, concepts, implementation, testing, examples, drift test) |
+
+## Build order (hackathon)
+1. Core critical path: 01 -> {02, 03, 07a} -> 04 -> 05 -> 06 -> 08-core (+ 07a smoke run).
+2. Optional (gated) items from every PRD's "Scope tiers" section, only after all core is done.
+3. Up to 5 sub-agents in parallel.
+
+## Core simplifications
+- 01: body size via Content-Length else read-then-check; one `cache_prefix`; simple append-only metrics list; no Server-Timing.
+- 02: rule 9 = quoted-span/timestamp checks + drop exact-substring notes (no 8-gram); partial overlap drops less severe claim + `other` warning.
+- 03: `prep()` rules-only, unsure -> no act; no leak CI test (hand-checked few-shot); no soft-timeout path.
+- 04: plain BM25 top-k + neighbors (no speaker floor, correction pull, RRF); one `cache_prefix`; 07 reads shortlist from stub-linker run.
+- 05: no timeframe check (V5 -> `insufficient_evidence` + `unsupported_claim`); fixed floors 0.5/0.6; verifier flag 11 only; minimal at-least cue list.
+- 06: no caching/warm-up, basic metrics, basic deadline tests with injected sleep; no latency suite.
+- 07: 07a only = ADHD fixtures + 8 variants + expected JSON + smoke script; harness/gold/modes deferred.
+- 08: backend README + `backend-api.md` + short architecture blurb + index links; ADRs/concepts/etc. deferred.
 
 ## Dependency graph
 ```

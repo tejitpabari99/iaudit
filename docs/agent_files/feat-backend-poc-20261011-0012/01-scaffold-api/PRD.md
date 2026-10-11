@@ -27,6 +27,15 @@ Stages 02-06 need a shared home: app, validation, errors, config, one LLM interf
 - Prompts, model benchmarking, API keys (owner step).
 - Contract edits (stays 1.0.0).
 
+## Scope tiers
+**Core** (must ship): R1, R2, R3 steps 1-6 and the core of 7 (parse, pipeline call, response validation; body size check = Content-Length when present, else read the body then check length), R4, R5 (all but `SERVER_TIMING`), R6 (tiers, JSON output, per-call timeout, global semaphore, deadline-gated retry, typed errors, `FixtureClient`, `StubClient`/`FailingClient`, single `cache_prefix`, basic per-call metrics), R7, R8 (`StubPipeline`, factory, 504 backstop), R9 logging allowlist, R10 tests for core items. Decisions D1-D12. Acceptance criteria 1-8, 10, 11, and 9 without optional parts.
+
+**Optional (gated: after all core work in every SP)**:
+- Streaming body-size cap (R3 step 1 streaming; O-4). Core fallback: check Content-Length, else read the whole body then check length.
+- Metrics depth beyond basic per-call latency/tokens: stage span API, `unit` field, `snapshot()` richness (R6 `MetricsCollector`). Core fallback: append-only list of `{call_tag, tier, model, in/out/cache tokens, latency_ms, attempts, ok}` plus a simple `snapshot()`.
+- `Server-Timing` header and `IAUDIT_SERVER_TIMING` (R3 step 7, R5 Misc).
+- Multiple cache breakpoints, `cache_prefixes` beyond one prefix (R6). Core fallback: single `cache_prefix`.
+
 ## Requirements
 
 **R1 Layout/tooling.** `backend/` with `pyproject.toml` (uv, Python 3.12, src layout, package `iaudit_backend`), ruff (lint+format), pytest (+ pytest-asyncio or anyio), `uv.lock` committed. Deps: fastapi, uvicorn, pydantic v2, pydantic-settings, jsonschema (+ `referencing`), litellm, httpx (tests). Declared now so later SPs add only rapidfuzz / rank_bm25. No spaCy/torch/embedding deps. Run: `uv run uvicorn iaudit_backend.app:app`; tests: `uv run pytest`; lint: `uv run ruff check`.
@@ -36,13 +45,13 @@ Stages 02-06 need a shared home: app, validation, errors, config, one LLM interf
 - Compiled validators cached at import; a missing/invalid schema fails startup, not first request.
 
 **R3 Request pipeline in the endpoint** (order matters):
-1. Body size check (Content-Length when present, else bytes read, streamed with cap) > `MAX_BODY_BYTES` → 413 `payload_too_large`.
+1. Body size check (Content-Length when present, else read the body and check its length) > `MAX_BODY_BYTES` → 413 `payload_too_large`. [OPTIONAL: streaming cap that aborts mid-read instead of reading the full body; see O-4.]
 2. Parse JSON myself from raw bytes (route takes `Request`, not a Pydantic body model, so FastAPI's own 422 never fires for the body). Not JSON / not an object → 400 `invalid_request`.
 3. `schema_version` present and != `"1.0.0"` → 400 `unsupported_version` (checked BEFORE schema validation, because the schema uses `const`, which would otherwise surface as a generic invalid_request). Missing `schema_version` → `invalid_request`.
 4. Turn count > `MAX_TURNS` or section count > `MAX_SECTIONS` → 413 `payload_too_large` (checked before full schema walk, on the parsed lists, so a 5k-turn body fails cheap).
 5. JSON-Schema validation; any error → 400 `invalid_request`. Message = first N issues as `path: message` (paths and schema messages only; never echo instance values, which may be transcript text).
 6. Extra checks: unique turn `id`s; unique section `id`s → 400 `invalid_request` (names the duplicate id? ids are "log only", non-PHI by contract; message names the count and the first duplicated id) [see O-3].
-7. Parse into internal Pydantic models; call the pipeline; validate the result with R2 `validate_response`; failure → 500 `internal_error` (never ship an invalid audit). Status 200. On success, when `IAUDIT_SERVER_TIMING=true`, adds a `Server-Timing` header (durations only, no PHI; values come from 06's metrics snapshot; per 06 R5/R8).
+7. Parse into internal Pydantic models; call the pipeline; validate the result with R2 `validate_response`; failure → 500 `internal_error` (never ship an invalid audit). Status 200. [OPTIONAL] On success, when `IAUDIT_SERVER_TIMING=true`, adds a `Server-Timing` header (durations only, no PHI; values come from 06's metrics snapshot; per 06 R5/R8).
 
 `request_id` is echoed on errors whenever the parsed object has a string `request_id` (even if the rest is invalid); otherwise omitted. Response success echo is the pipeline's job but the seam asserts it (rule 10).
 
@@ -68,7 +77,7 @@ The contract lists 400 and 422 as typical for `invalid_request`; we use 400 for 
 | Timeouts | `LLM_TIMEOUT_S` per call (default 30), `AUDIT_DEADLINE_S` 60 (hard cap; 06 consumes), `LLM_MAX_RETRIES` 1 |
 | Concurrency | `LLM_MAX_CONCURRENCY` 20 (global semaphore in the client; 06 may sub-limit) |
 | Mode | `LLM_MODE` = `live` \| `fixture` \| `stub` (default `live`); `FIXTURE_DIR` |
-| Misc | `LOG_LEVEL` INFO, `PIPELINE` `stub` \| `full` (default `full`, per 06 R8), `SERVER_TIMING` true (per 06 R5) |
+| Misc | `LOG_LEVEL` INFO, `PIPELINE` `stub` \| `full` (default `full`, per 06 R8), [OPTIONAL] `SERVER_TIMING` true (per 06 R5) |
 Defaults exist for all; startup logs the non-secret effective config (model names, limits). Keys are read by LiteLLM from standard env vars, never stored in Settings.
 
 **R6 LLM client** (`llm/`). Async-first interface used by every stage:
@@ -77,13 +86,13 @@ class LLMClient(Protocol):
     async def complete_json(self, req: LLMRequest) -> LLMResult: ...
 # LLMRequest: tier (cheap|mid|strong), system, messages/user, response_model | json_schema,
 #   cache_prefix: str|None (hint: stable leading text to mark cacheable; the 1-item case of cache_prefixes),
-#   cache_prefixes: list[str] (up to 2 ordered cache breakpoints, each ends an Anthropic cache_control block; per 06 R6), max_tokens, temperature=0,
+#   [OPTIONAL] cache_prefixes: list[str] (up to 2 ordered cache breakpoints, each ends an Anthropic cache_control block; per 06 R6), max_tokens, temperature=0,
 #   timeout_s|None, call_tag (stage name for logs/metrics, e.g. "link"), fixture_key|None
 # LLMResult: parsed (pydantic obj), usage (in/out/cache_read/cache_write tokens), latency_ms, model, attempts
 ```
 - `LiteLLMClient`: `litellm.acompletion` with JSON-schema response format; validates into the Pydantic `response_model`; one repair-free re-ask is NOT done (retry covers transport/429/5xx/invalid-JSON once, then raises). `cache_prefix` becomes an Anthropic `cache_control` block on the system/prefix message; ignored by providers that don't support it (passthrough, not interpreted). Per-call `asyncio.timeout`; global semaphore from R5. Per 06 R8: `acompletion` is called with `num_retries=0` and no fallbacks (hidden LiteLLM retries would bypass the budget); the client's own transport retry is **deadline-gated**: it retries only if `ctx.deadline` leaves at least one call timeout plus margin, otherwise it raises the original error. `CancelledError` is never caught or converted; only the client's own `asyncio.timeout` becomes `LLMTimeout`.
 - Errors typed: `LLMTimeout`, `LLMUnavailable` (auth/provider down), `LLMBadOutput` (unparseable after retry). Stages decide the degraded behavior (locked: section omitted / claim insufficient_evidence); the client never swallows.
-- `MetricsCollector` (per-request, contextvar or passed object): list of `{call_tag, tier, model, unit, in/out/cache tokens, latency_ms, attempts, ok}` (`unit` = section index or claim id, per 06 R8); a stage span API (first start / last end per stage) and `snapshot() -> dict` (JSON-able, text-free); 06 reads it for the log line and latency budget. No prompt or output text stored.
+- `MetricsCollector` (per-request, contextvar or passed object). Core: list of `{call_tag, tier, model, unit, in/out/cache tokens, latency_ms, attempts, ok}` and a simple `snapshot() -> dict` (JSON-able, text-free); 06 reads it for the log line. [OPTIONAL: `unit` field (section index or claim id, per 06 R8) and a stage span API (first start / last end per stage) for the latency budget.] No prompt or output text stored.
 - `FixtureClient` (mode `fixture`): deterministic replay keyed by `sha256(tier + call_tag + canonical request)` or explicit `fixture_key`, from JSON files in `FIXTURE_DIR`; missing key raises `FixtureMiss` (loud, never a network fallback). Record helper (opt-in env `LLM_RECORD=1` with live client) writes fixtures; used by 07 and stage tests.
 - `StubClient` (mode `stub`): returns a caller-registered canned object per `call_tag` (in-code, for unit tests); also a `FailingClient(exc)` for timeout/failure paths.
 - Client is created once in app lifespan, injected via FastAPI dependency; tests override it.
@@ -140,7 +149,7 @@ Async design for 06: everything awaits; the client holds one global semaphore (c
 - [OPEN] O-2 Prompt-cache hint through LiteLLM: `cache_control` on a content block should pass through to Anthropic; verify token-usage fields (`cache_read_input_tokens`) surface in `usage`. Owner: 06 benchmark.
 - [OPEN] O-3 Duplicate-id message naming an id: ids are non-PHI by contract intent but could be derived from names; safer default is count-only. Choose count-only unless reviewers want ids.
 - [RESOLVED: SP01 default `stub`; SP06 flips to `full`; tests/fixtures always set `IAUDIT_PIPELINE=stub` and never rely on the default] O-5.
-- [OPEN] O-4 Streaming body size cap: ASGI servers may buffer; enforce cap while reading chunks. Acceptable for POC.
+- [OPEN] [OPTIONAL] O-4 Streaming body size cap: ASGI servers may buffer; enforce cap while reading chunks. Acceptable for POC.
 - [RESOLVED: yes] Schema validation cost on 2 MB bodies: jsonschema runs in a worker thread (`run_in_threadpool`) to avoid blocking the loop; no further optimization.
 - [RESOLVED: contract shows no request-level `role` need] Missing `role` is valid input; this SP does no role handling (05).
 - [DEFERRED] `rate_limited` emission, auth, request-id generation when absent, multi-worker deployment.
@@ -155,6 +164,6 @@ Async design for 06: everything awaits; the client holds one global semaphore (c
 6. Forced pipeline exception -> 500 `internal_error`; forced `LLMUnavailable` -> 503 `unavailable`; unknown route -> 404 `other`.
 7. Schemas load from `docs/contracts/` with no copies in `backend/`; deleting that dir makes startup fail with a clear message.
 8. CORS: preflight from `http://localhost:5173` allowed, from another origin not; origins change via `IAUDIT_CORS_ORIGINS`.
-9. `FixtureClient` returns recorded JSON offline and raises `FixtureMiss` on unknown keys; `LiteLLMClient` is unit-tested against a faked `acompletion` (timeout, one retry, bad JSON, usage/latency captured, cache_control present when `cache_prefix` set).
+9. `FixtureClient` returns recorded JSON offline and raises `FixtureMiss` on unknown keys; `LiteLLMClient` is unit-tested against a faked `acompletion` (timeout, one retry, bad JSON, usage/latency captured, cache_control present when `cache_prefix` set; [OPTIONAL] two `cache_prefixes` yield two breakpoints).
 10. Log-capture test: sentinel text in a transcript never appears in logs or error messages on any path.
 11. Enum-drift test: model enums equal schema enums for verdicts, concerns, roles, warning codes, evidence roles.

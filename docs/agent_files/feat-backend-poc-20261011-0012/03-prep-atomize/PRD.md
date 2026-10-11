@@ -25,15 +25,23 @@ Later stages need turns that know who asked and who answered (checks 3, 9, 10), 
 - Diagnosis, scoring, protocol review. `label`/`score` are not sent to the atomizer and never become claims.
 - Role inference, speaker repair, diarization fixes, duration as a scale, embeddings, spaCy.
 
+## Scope tiers
+**Core** (must ship): R1 turn index (`act_source` is `rule` only), R2 rules-based dialogue acts (every "unsure" case resolves to no act, i.e. `none`; polar-token rules as written), R4 Q-to-A pairing, R5 atomize per section, R6 claim model with slots, R7 granularity rules, R8 `scales.py`, R9 validation with `locate()` spans, one retry and section failure kinds, R10 atomizer prompt and few-shot file (without the CI leak test), R11 atomizer config, R12 logging, `prep` (rules only) and `atomize_section`/`atomize_sections`, `out_of_scope` + `oos_reason`. Decisions D1, D3-D10, D12, D13 (D2 and D11 as noted). Acceptance criteria 1, 3-7, 9, 10 and 2 in its zero-LLM form.
+
+**Optional (gated: after all core work in every SP)**:
+- [OPTIONAL] Cheap-LLM act tagging for "unsure" turns (R3, `act_source: llm | rule_fallback`, `degraded_chunks`, `PREP_*` config, prep LLM prompt, D2). Core fallback: unsure maps to none.
+- [OPTIONAL] 8-word leakage CI test (R10 leak guard, D11 test, acceptance 8). Core fallback: few-shot uses only the fictional "Jordan" set, checked by hand at review.
+- [OPTIONAL] `prep_rules_only` soft-timeout path (architecture line). Core fallback: prep is rules-only already when LLM tagging is off, so `prep()` itself is the no-LLM path and no separate soft-timeout path exists.
+
 ## Requirements
 
 ### R1 Prep: turn index
-`IndexedTurn`: `index` (array position; this is the contract span index), `id`, `speaker`, `role: Role | None` (copied, never inferred or propagated from other turns of the same speaker), `text`, `length` (`len(text)`, code points), `acts: frozenset[Act]`, `act_source: rule | llm | rule_fallback`, `responds_to: int | None`. Acts: `question, answer, backchannel, hypothetical, correction`; empty set = none. A turn can carry several (e.g. `answer`+`correction`).
+`IndexedTurn`: `index` (array position; this is the contract span index), `id`, `speaker`, `role: Role | None` (copied, never inferred or propagated from other turns of the same speaker), `text`, `length` (`len(text)`, code points), `acts: frozenset[Act]`, `act_source: rule` (core) `| llm | rule_fallback` [OPTIONAL], `responds_to: int | None`. Acts: `question, answer, backchannel, hypothetical, correction`; empty set = none. A turn can carry several (e.g. `answer`+`correction`).
 
 ### R2 Prep: deterministic rules
 Order: normalise (lowercase, strip punctuation for lexicon match only), then per act yes / no / unsure.
 
-| Act | Yes (rule) | Unsure (goes to LLM) |
+| Act | Yes (rule) | Unsure (core: resolves to none; [OPTIONAL] goes to LLM, R3) |
 |---|---|---|
 | question | Sentence ends with `?` (excluding tag tails: `you know?`, `right?`, `y'know?`); sentence opens with interrogative or aux (`who/what/when/where/why/how/do/does/did/is/are/can/could/would/have/has`); elicitation openers (`tell me`, `describe`, `walk me through`) | Mid-sentence `?`, aux opener inside a longer declarative |
 | backchannel | Whole turn (≤3 tokens) in the pure-continuer lexicon: `hm, mm, mhm, uh-huh, right, okay, i see, got it, sure` | Polar tokens (`yeah, yes, no, nope, yep`) alone, see R3 |
@@ -43,10 +51,11 @@ Order: normalise (lowercase, strip punctuation for lexicon match only), then per
 
 Polar single tokens right after a question from a different speaker are `answer` (a bare "yes" can support a claim, mission). The same tokens elsewhere are `backchannel`. Pure continuers after a question stay `backchannel` and are NOT answers (ADHD turn 13 "Hm.").
 
-### R3 Prep: LLM for undecided turns only
+### R3 [OPTIONAL] Prep: LLM for undecided turns only
+Gated. Core fallback: unsure turns resolve to no act (`none`) and `prep()` makes zero LLM calls; nothing in R4-R12 depends on this section.
 - Only turns with an "unsure" flag go to the LLM (cheap tier, `call_tag="prep_acts"`). Turns with no signal and no question before them are `none` by rule; no LLM call.
 - Chunking: windows of `PREP_CHUNK_TURNS` (default 30) undecided-or-context turns with `PREP_CONTEXT_TURNS` (3) read-only context either side; chunks run via `asyncio.gather` (global semaphore in 01's client caps concurrency).
-- Output schema: `[{index, acts: [...]}]` for requested indices only. Validate: indices subset of requested, acts in enum, no extras. Invalid chunk: rely on the client's one retry, then fall back to the rule best guess (`act_source=rule_fallback`) and set `PrepResult.degraded_chunks += 1`. Prep never fails a request.
+- Output schema: `[{index, acts: [...]}]` for requested indices only. Validate: indices subset of requested, acts in enum, no extras. Invalid chunk: rely on the client's one retry, then fall back to the rule best guess (`act_source=rule_fallback`) and set `PrepResult.degraded_chunks += 1` (field exists only with this feature). Prep never fails a request.
 - Zero unsure turns means zero LLM calls (typical for short transcripts).
 
 ### R4 Prep: question-answer pairing
@@ -99,14 +108,14 @@ Severity, 0-4: `0 none`, `1 mild` (slight, a little, "some difficulty"), `2 mode
 
 ### R10 Prompt design
 System prompt: task, scope rules, taxonomy (R6/R7/R8 definitions), output JSON schema (Pydantic `AtomizerOutput`, `strict`), rule "segments must be copied character-for-character, never paraphrased", rule "never name a speaker not in the roster; never infer roles". Few-shot: 4 examples in `prompts/atomize_fewshot.json`, each section text plus gold output, covering (a) conjunction split + because link + conclusion, (b) informant vs self report with estimate and shared lead-in words, (c) negation + childhood timeframe + numeric rate, (d) scoring rule + recommendation out_of_scope + non-contiguous claim. All use a fictional person ("Jordan") and invented behaviours different from the approved ADHD example and its 8 variants. The "forgetful because… medicines and skips dinner" sentence and anything from the CDR case are NOT used in the prompt.
-**Leak guard:** a CI test fails if any 8-word window from the few-shot texts appears in any eval fixture/gold file (`backend/tests/data`, 07's fixture dir). Few-shot file carries `split: "prompt"`; 07 must exclude it from eval sets.
-Prep LLM prompt: act definitions plus 2 inline examples drawn from the rule table (not from the ADHD set). Tier names only, never model ids.
+**[OPTIONAL] Leak guard:** a CI test fails if any 8-word window from the few-shot texts appears in any eval fixture/gold file (`backend/tests/data`, 07's fixture dir). Few-shot file carries `split: "prompt"`; 07 must exclude it from eval sets.
+[OPTIONAL] Prep LLM prompt: act definitions plus 2 inline examples drawn from the rule table (not from the ADHD set). Tier names only, never model ids.
 
 ### R11 Config (additive to 01's `Settings`)
-`PREP_CHUNK_TURNS` 30, `PREP_CONTEXT_TURNS` 3, `ATOMIZE_MAX_CLAIMS` 30, `ATOMIZE_MAX_TOKENS` 4000, `ATOMIZE_RETRY` true. Stored in `Settings` (small edit to 01's `config.py`, coordinated).
+[OPTIONAL] `PREP_CHUNK_TURNS` 30, `PREP_CONTEXT_TURNS` 3; core: `ATOMIZE_MAX_CLAIMS` 30, `ATOMIZE_MAX_TOKENS` 4000, `ATOMIZE_RETRY` true. Stored in `Settings` (small edit to 01's `config.py`, coordinated).
 
 ### R12 Logging
-Counts only: turns, undecided turns, chunks, degraded chunks, claims per section, dropped, gaps, retries, failures by reason, token usage via `MetricsCollector`. No turn text, section text, segments, or propositions (01 R9 allowlist).
+Counts only: turns, undecided turns, [OPTIONAL: chunks, degraded chunks,] claims per section, dropped, gaps, retries, failures by reason, token usage via `MetricsCollector`. No turn text, section text, segments, or propositions (01 R9 allowlist).
 
 ## Architecture
 ```
@@ -118,7 +127,7 @@ Public surface:
 async def prep(turns: list[Turn], ctx: RequestContext) -> PrepResult      # turns, qa_pairs, degraded_chunks
 async def atomize_section(section: Section, roster: list[Speaker], ctx) -> SectionAtoms   # single unit, called per section by 06 (per 06 R8)
 async def atomize_sections(sections: list[Section], turns: list[Turn], ctx) -> list[SectionAtoms]   # now a thin gather wrapper over atomize_section
-def prep_rules_only(turns: list[Turn]) -> PrepResult   # no LLM; 06 uses it on prep soft timeout (per 06 R3/R8)
+# [OPTIONAL] def prep_rules_only(turns: list[Turn]) -> PrepResult   # no LLM; 06 uses it on prep soft timeout (per 06 R3/R8). Core: prep() is already rules-only.
 # SectionAtoms: section_index, status, claims: list[AtomicClaim], links, dropped, coverage_gaps, failure|None
 ```
 Uses 01's `LLMClient.complete_json(LLMRequest)`, `LLMResult`, `Settings`, `RequestContext` (deadline, metrics), tiers `cheap/mid`, `StubClient`/`FixtureClient` for tests, `Role`/`Turn`/`Section` models. Assumption for 02: 02's `ClaimDraft` uses these same names: `segments`, `span_hint`, `scope`, `oos_category` (fixed reason string). 02 re-verifies the hint and falls back to `locate()` [RESOLVED O-1].
@@ -127,7 +136,7 @@ Uses 01's `LLMClient.complete_json(LLMRequest)`, `LLMResult`, `Settings`, `Reque
 | # | Decision | Choice | Alternatives considered | Why |
 |---|---|---|---|---|
 | D1 | Prep and atomize | Independent, run concurrently | Atomizer sees dialogue acts | Saves latency; claims come from assessment text only |
-| D2 | LLM use in prep | Only unsure turns | Every turn per chunk | Fewer tokens; rules are cheap and testable |
+| D2 | [OPTIONAL] LLM use in prep | Only unsure turns (core: none) | Every turn per chunk | Fewer tokens; rules are cheap and testable |
 | D3 | Act granularity | Turn-level multi-label | Sentence spans | Enough for 04/05; contract evidence is turn/char anyway |
 | D4 | Pairing basis | `speaker` string, not role | Role-based | Roles optional; never inferred |
 | D5 | Polar "yes" | Answer after other speaker's question, else backchannel | Always backchannel | Mission: short "yes" can support a claim |
@@ -136,7 +145,7 @@ Uses 01's `LLMClient.complete_json(LLMRequest)`, `LLMResult`, `Settings`, `Reque
 | D8 | Out-of-scope reason | Category from LLM, sentence from code | LLM writes reason | Contract rule 9 (no copied text), fixed neutral wording |
 | D9 | Reported-by | List of `{source, speaker}`; separate claim per account | Single reporter | Check 11 and "Alex estimates" need the accounts kept apart |
 | D10 | Scales | Two ordinal scales, numeric -> bucket in code | LLM scores 1-10; one shared scale | Comparable both directions; code beats LLM on numbers |
-| D11 | Few-shot data | Fictional "Jordan" set, 8-gram leak test | Reuse approved ADHD sentences | Keeps acceptance set honest |
+| D11 | Few-shot data | Fictional "Jordan" set, [OPTIONAL] 8-gram leak test | Reuse approved ADHD sentences | Keeps acceptance set honest |
 | D12 | Section failure | Fail, do not guess | Fall back to sentence-split claims | Locked decision; unreliable claims erode trust |
 | D13 | Label/score | Not sent to the atomizer | Send as context | Never audited; avoids spurious claims |
 
@@ -151,12 +160,12 @@ Uses 01's `LLMClient.complete_json(LLMRequest)`, `LLMResult`, `Settings`, `Reque
 
 ## Acceptance Criteria
 1. Rule tests: ADHD turn 1 not hypothetical, turn 5 not correction, turn 11 correction, turn 13 `backchannel` (not answer), turn 3 `answer`; `?` tag tails not questions; polar token rules. (Used as behavior checks on the test fixture only, never in the prompt.)
-2. A transcript with zero unsure turns makes zero LLM calls; unsure turns produce one call per chunk, parallel; an invalid chunk falls back to rules with `degraded_chunks` set.
+2. A transcript with zero unsure turns makes zero LLM calls (core: prep never makes LLM calls). [OPTIONAL] Unsure turns produce one call per chunk, parallel; an invalid chunk falls back to rules with `degraded_chunks` set.
 3. Pairing: ADHD turns (0->1; 2->3; 12->13 including backchannel) pair correctly with missing `role` on every turn; `role` stays `None`.
 4. Atomizer with stub/fixture client: "She is forgetful because she forgets medicines and skips dinner" yields 3 claims, the conclusion out_of_scope, and one causal link; Alex/Sam sentence yields separate informant and self claims, the latter `hedged`.
 5. All returned segments are exact substrings (or flagged `unresolved`); no two claims overlap; `span_hint` falls inside the section; non-contiguous claims set `span_quality`.
 6. Numeric normalisation: "three or four times a week" -> 3.5/wk -> `often`; "twice a month" -> `sometimes`; "every day" -> `always`; "some difficulty" vs "poor" -> step_diff -2; unit tests cover both directions.
 7. Section with a timeout, bad JSON twice, or only unresolvable claims returns `status=failed` with a reason; other sections still return; one invalid-then-valid reply succeeds via exactly one retry.
-8. Leak test passes: no 8-gram overlap between `atomize_fewshot.json` and any eval fixture.
+8. [OPTIONAL] Leak test passes: no 8-gram overlap between `atomize_fewshot.json` and any eval fixture.
 9. No turn/section text in logs or in failure reasons (sentinel test).
 10. Whole suite runs offline (`LLM_MODE=stub`/`fixture`).

@@ -25,6 +25,24 @@ Link output says what evidence exists; nothing yet says whether it faithfully su
 - LLM-written explanations; contract changes or concern renames; self-consistency voting; NLI/spaCy/embeddings.
 - Counterevidence search for `out_of_scope` claims (deferred in brainstorm); they pass through.
 
+## Scope tiers
+Hackathon build: **Core** is the critical path and ships first. **Optional** items are gated: start only after ALL core work in every sub-project is finished. No core item depends on an optional one.
+
+**Core**
+- R1 entry points (`check_claims`, `check_one`, `stalled_draft`, `passthrough_oos`, `decide`).
+- R2 group A: A3 reporter attribution, A9 question-as-answer, missing-role rule (skip check, keep `ambiguous_turns`, 02 emits `ambiguous_speaker`), zero-call short-circuits.
+- R3 verifier call (buckets 1, 2, 5, 7 relation/amount observations), plus the P1 flags (4/6/8/10/11/12) as extra output fields, accepted at one fixed confidence floor (`CHECK_MIN_CONF_P1` = 0.6, P0 floor 0.5; no calibration).
+- R4 items 1-3 (fixed floors, polarity, ordinal both directions with "inflates"/"understates"), 5, 6 (verifier flag only), 7, 8 (certainty, conflicting accounts, causal, correction/context/element gap via verifier flags), 9 inference rule. Item 4 (timeframe) is Optional. At-least cues: a **minimal** fixed list (repeatedly, frequently, regularly, often, several, many, multiple) so faithful S5 is not flagged.
+- R5 roles, R6 decision table D0-D9 + dedup, R7 explanation templates, R8 failure/logging/config.
+- Acceptance criteria 1-2, 4-5, 7-9 and the core part of 3 and 6.
+
+**Optional (gated: after all core work in every SP)**
+- Timeframe bucket 4 in code (R4 item 4, row D6 `timeframe_mismatch`, Variant 5 path, D9 decision). Core fallback: no timeframe demotion; V5's turn 17 arrives as `qualifying` from 04, so no support remains and the claim lands on D7 `insufficient_evidence` + `unsupported_claim`.
+- P1 confidence calibration / precision-based suppression (O-5) beyond the fixed floor.
+- Code rate-ratio check for conflicting accounts (R4 item 6 code path, `CHECK_RATE_RATIO`). Core fallback: rely on the verifier flag 11 alone.
+- At-least cue list refinements beyond the minimal list (O-2, `bound` on `Quantity`).
+- Few-shot leakage tests (acceptance 10 8-gram CI test).
+
 ## Requirements
 
 ### R1 Entry point and I/O
@@ -53,21 +71,21 @@ Inputs: `AtomicClaim.reported_by`, `subject_speaker`, `IndexedTurn.speaker/role`
 - **Claim-level flags** `flags[]`: `{type, keys[], conf}` for `timeframe_mismatch`, `certainty_inflation`, `context_stripping` (item contains a qualifier the claim drops), `correction_ignored` (a later turn retracts/changes the cited item), `conflicting_accounts_flattened` (accounts differ, claim presents agreement), `unsupported_causal_link` (claim asserts cause-effect the transcript does not establish; a speaker asserting the cause counts as established), `element_gap` (some element of the claim is established by no item). Flags 4/6/8/10/11/12 are the P1 quick pass; others feed P0 buckets.
 - **Inference groups** `inferences[]` per inference item: `{key, step_acceptable, conf}`. Premise judgments are the premises' own `items[]` relations.
 - **Validation**: unknown keys dropped; every evidence key must be judged. Missing items -> one semantic retry (terse key list, no text), then the claim stalls (`reason=bad_output`). Unjudged items never count as support.
-- **Prompt**: taxonomy (relation, polarity, scales, flag definitions, the "question is not evidence" rule, "never guess a speaker or role"), few-shot `prompts/check_fewshot.json` (`split: "prompt"`; fictional, includes clean no-flag cases to curb over-flagging and a vague-quantifier case). Same 8-gram leak CI test as 03 R10 / 07 R11; no ADHD or CDR text. Tier names only.
+- **Prompt**: taxonomy (relation, polarity, scales, flag definitions, the "question is not evidence" rule, "never guess a speaker or role"), few-shot `prompts/check_fewshot.json` (`split: "prompt"`; fictional, includes clean no-flag cases to curb over-flagging and a vague-quantifier case). Same 8-gram leak CI test as 03 R10 / 07 R11 **[OPTIONAL]**; no ADHD or CDR text. Tier names only.
 - **Cache [RESOLVED: per 06 R6]**: prompts are built with 06's `pipeline/layout.py` (common system -> transcript -> stage -> claim), shared with 04; 05 no longer renders its own prefix. `cache_prefixes` = [common system + transcript (whole mode, byte-identical to 04's, no act hints)], [check stage block: instructions + few-shot]; claim block last (act hints, claim, evidence items). Shortlist mode: prefix = common system + check stage block, and the claim block reuses the exact shortlist rendering 04 used.
 
 ### R4 Code synthesis signals (`synth.py`, `amounts.py`)
-1. **Confidence floor.** `conf` maps low/medium/high = 0.3/0.6/0.9. P0 observations (relation, experiencer, polarity) need >= `CHECK_MIN_CONF_P0` (default 0.5); P1 flags need >= `CHECK_MIN_CONF_P1` (default 0.6, i.e. medium). Below floor: dropped (counted, logged). Eval-driven suppression tuning is deferred (O-5).
+1. **Confidence floor.** Core: fixed floors only. `conf` maps low/medium/high = 0.3/0.6/0.9. P0 observations (relation, experiencer, polarity) need >= `CHECK_MIN_CONF_P0` (default 0.5); P1 flags need >= `CHECK_MIN_CONF_P1` (default 0.6, i.e. medium). Below floor: dropped (counted, logged). Eval-driven suppression tuning / calibration is **[OPTIONAL]** and deferred (O-5).
 2. **Polarity.** Claim `polarity` vs item `polarity` on items with relation `contradicts` and `experiencer = claim_subject`: both known and different -> `negation_reversal`.
 3. **Ordinal amounts, both directions.** Per kind (frequency, severity), claim `quantities` (03 buckets) vs verifier value mapped in code (`rate_per_week` -> `bucket_from_rate`, else `lexicon_bucket(raw)`, else `bucket_guess` flagged `basis=model`). Only `entails` items from the claim's accounts are compared. Pairs are same-basis first (numeric-numeric, relative-relative); take the pair with the smallest `|d|` (benefit of the doubt), `d = step_diff(claim, evidence)`, positive = claim stronger. Mixed-basis only if no same-basis pair.
    - **Material** iff `|d| >= CHECK_STEP_MATERIAL` (default 1) and not *adjacent-ambiguous*; adjacent-ambiguous = `|d| == 1` and (basis is mixed or the evidence rate sits within 15 percent of the bucket boundary). [OPEN O-1]
-   - **At-least cues.** If the claim `raw` carries a lower-bound cue (repeatedly, frequently, regularly, often, several, many, multiple) and `d < 0`, it is not an understatement (vague quantifiers are compatible with a higher rate). Small list in `amounts.py`. "Some", "mild", "a little" are level words, not at-least cues.
+   - **At-least cues.** If the claim `raw` carries a lower-bound cue (repeatedly, frequently, regularly, often, several, many, multiple) and `d < 0`, it is not an understatement (vague quantifiers are compatible with a higher rate). Small list in `amounts.py` (core: minimal list as in Scope tiers; **[OPTIONAL]** refinements beyond it). "Some", "mild", "a little" are level words, not at-least cues.
    - **Stronger (d > 0):** concern `frequency_severity_inflation`, verdict `partially_supported`, explanation says "inflates". Escalates to `contradicted` when evidence bucket is `0` (never/none) and claim >= 1, or `d >= CHECK_CONTRADICT_GAP` (default 3); the compared item is then relabelled `contradicting` so rule 3 holds.
    - **Weaker (d < 0):** same concern type, `partially_supported`, explanation says "understates", never `contradicted`.
    - **Tie / immaterial / no same-kind value on either side:** no concern.
-4. **Timeframe (bucket 4, stretch).** Claim `timeframe` vs item `timeframe` (or a flag). Mismatch = claim current/future vs item past/childhood/hypothetical, claim childhood/past vs item current, or any claim vs hypothetical. Implicit-current claims (`timeframe_explicit=false`) fire only at `conf = high`. Mismatched items are **demoted** to `qualifying` (they no longer count as support); the concern is emitted only if no supporting item remains (R6 row D6).
+4. **[OPTIONAL] Timeframe (bucket 4, stretch).** Core fallback: no code timeframe check; demoted/childhood items come from 04 as `qualifying` and the claim falls to D7. Claim `timeframe` vs item `timeframe` (or a flag). Mismatch = claim current/future vs item past/childhood/hypothetical, claim childhood/past vs item current, or any claim vs hypothetical. Implicit-current claims (`timeframe_explicit=false`) fire only at `conf = high`. Mismatched items are **demoted** to `qualifying` (they no longer count as support); the concern is emitted only if no supporting item remains (R6 row D6).
 5. **Certainty (6).** Fires only for claim `hedged=false` vs item `hedged_strong`; `hedged_light` ("probably every day") is ignored.
-6. **Conflicting accounts (11).** Fires on the verifier flag, or in code when the claim has >=2 `reported_by` accounts and numeric `rate_per_week` of different accounts differ by ratio >= `CHECK_RATE_RATIO` (default 1.5). Needed because "twice a month" (0.46/wk) and "once a month" (0.23/wk) fall in one ordinal bucket, so amounts alone cannot see it.
+6. **Conflicting accounts (11).** Core: fires on the verifier flag. **[OPTIONAL] code path:** also fires in code when the claim has >=2 `reported_by` accounts and numeric `rate_per_week` of different accounts differ by ratio >= `CHECK_RATE_RATIO` (default 1.5). Needed because "twice a month" (0.46/wk) and "once a month" (0.23/wk) fall in one ordinal bucket, so amounts alone cannot see it.
 7. **Causal (12).** Considered only when the claim has a causal cue (lexicon: because, caused, due to, led to, resulted in, so, therefore; or an assessor-sourced 03 `link` naming it); otherwise the flag is ignored. Reported/believed links (`source=reported`) are not flagged.
 8. **Correction (10), context (8), element gap:** verifier flags above the floor. Items cited by an accepted 8/10/12 flag count as partial support (they are the source the claim drew from), so a flagged claim lands on `partially_supported`, not `insufficient_evidence` [OPEN O-9].
 9. **Inference rule.** An inference group is *supported* iff every premise item has relation `entails` and `step_acceptable` at/above the floor. A failed group: premises relabelled `qualifying`, and they supply no support. Supported group: premises are `supporting` evidence like any other.
@@ -84,7 +102,7 @@ Inputs: `AtomicClaim.reported_by`, `subject_speaker`, `IndexedTurn.speaker/role`
 | D3 | A9 fires | `insufficient_evidence` | `question_as_answer` on the question/non-answer item(s) (no call) |
 | D4 | contradicting >= 1, supporting = 0 | `contradicted` | most specific of: `wrong_attribution` > `negation_reversal` > `frequency_severity_inflation` (zero/gap escalation) > `contradictory_evidence` |
 | D5 | contradicting >= 1, supporting >= 1 | `partially_supported` (never `supported`; matches 02 R4) | `conflicting_accounts_flattened` > `correction_ignored` > `contradictory_evidence`, plus any independent concern |
-| D6 | no support, no contradiction, demoted items exist | `insufficient_evidence` | `timeframe_mismatch` (timeframe demotion) or `unsupported_claim` (failed inference) |
+| D6 | no support, no contradiction, demoted items exist | `insufficient_evidence` | `timeframe_mismatch` **[OPTIONAL]** (timeframe demotion; core falls to D7) or `unsupported_claim` (failed inference) |
 | D7 | no support, nothing else | `insufficient_evidence` | `unsupported_claim` |
 | D8 | supporting >= 1, no contradicting, >= 1 surviving concern | `partially_supported` | reporter `wrong_attribution`, `frequency_severity_inflation` (inflates/understates), `certainty_inflation`, `context_stripping`, `unsupported_causal_link`, `conflicting_accounts_flattened`, `unsupported_claim` for `element_gap` |
 | D9 | supporting >= 1, no contradicting, no concern | `supported` | none |
@@ -120,8 +138,8 @@ Uses 01 `LLMClient`, `RequestContext`, `Settings`, tier `mid`, Stub/FixtureClien
 | 2 | turn 5 "Not really" | relation `contradicts`, evidence `negated` vs claim `affirmed`, experiencer = subject -> `negation_reversal` (suppresses generic `contradictory_evidence`) | D4 `contradicted` + `negation_reversal` |
 | 3 | turn 21 (sam1), `contradicting` | `contradicts`, `experiencer=other_person` (Sam is the forgetful one) -> `wrong_attribution`, which suppresses `negation_reversal` ("He's good with appointments" is also negated) | D4 `contradicted` + `wrong_attribution` |
 | 4 | question 12 + "Hm." 13 as one `qualifying` item, `answer_status=non_answer` | A9: no endorsed item, question turn role `interviewer` -> `question_as_answer`; zero verifier calls | D3 `insufficient_evidence` + `question_as_answer`; evidence `qualifying` (12-13) |
-| 5 | turn 17, `qualifying` | item `entails` the behaviour, `timeframe=childhood/past` vs claim current explicit -> mismatch, item demoted, no support left (or claim flag `timeframe_mismatch`) | D6 `insufficient_evidence` + `timeframe_mismatch` |
-| 6 | 19 (supporting), 23 (contradicting or qualifying) | claim has 2 `reported_by` accounts; Sam 0.46/wk vs Alex 0.23/wk: ratio 2.0 >= 1.5 (+ verifier flag 11); same ordinal bucket so no amount concern | D8 (or D5 if 23 is `contradicting`) `partially_supported` + `conflicting_accounts_flattened` |
+| 5 **[OPTIONAL]** | turn 17, `qualifying` | item `entails` the behaviour, `timeframe=childhood/past` vs claim current explicit -> mismatch, item demoted, no support left (or claim flag `timeframe_mismatch`) | D6 `insufficient_evidence` + `timeframe_mismatch` |
+| 6 | 19 (supporting), 23 (contradicting or qualifying) | claim has 2 `reported_by` accounts; Sam 0.46/wk vs Alex 0.23/wk: ratio 2.0 >= 1.5 (+ verifier flag 11); same ordinal bucket so no amount concern | D8 (or D5 if 23 is `contradicting`) `partially_supported` + `conflicting_accounts_flattened` (core: via verifier flag 11; ratio check is **[OPTIONAL]**) |
 | 7 | turn 11 | `entails` with flag `context_stripping` citing 11 (qualifier "ran out of paint" dropped); cited item counts as partial support | D8 `partially_supported` + `context_stripping` |
 | 8 | turn 25 | causal cue "caused"; flag `unsupported_causal_link` citing 25; cited item counts as partial support | D8 `partially_supported` + `unsupported_causal_link` |
 
@@ -140,7 +158,7 @@ Impact of 07 open items:
 | D6 | Zero-call paths | No evidence, or only question/non-answer evidence | Always call | Saves latency/cost; deterministic |
 | D7 | Understated | Same concern type, `partially_supported`, "understates"; never `contradicted` | New type | Locked brainstorm decision |
 | D8 | Mixed support/contradiction | `partially_supported` + specific concern | `contradicted` | Contradiction of part only; matches 02 R4 |
-| D9 | Timeframe | Demote mismatched evidence, concern only if no support left | Concern alongside `supported` | Evidence from another period does not substantiate the claim |
+| D9 [OPTIONAL] | Timeframe | Demote mismatched evidence, concern only if no support left | Concern alongside `supported` | Evidence from another period does not substantiate the claim |
 | D10 | Verifier context | Same turns 04 showed | Cited items only | Flags 8/10/11 need surrounding turns; cache reuse |
 | D11 | Generic vs specific concern | Specific suppresses generic | Emit all | Contract wants no repetitive findings; avoids FP on gold |
 | D12 | Quote existence | Rely on 04 dry-run + 02 | Re-match in 05 | One matcher (02 `locate`) |
@@ -167,13 +185,13 @@ Impact of 07 open items:
 - [DEFERRED] Per-account value comparison beyond speaker/role match; self-consistency; contract rename to `frequency_severity_mismatch`; counterevidence for out-of-scope claims; LLM rewriting of explanations.
 
 ## Acceptance Criteria
-1. Variant map: with a stub verifier returning the observations in the Variant map (no network), each of the 8 variants plus the faithful claims yields the listed verdict, concern(s) and evidence roles; V1 explanation contains "inflates"; a fictional severity pair "mild" vs "severe" yields `partially_supported` + `frequency_severity_inflation` with "understates".
+1. Variant map (V5 **[OPTIONAL]**; core expects D7 for it; V6 core via verifier flag 11): with a stub verifier returning the observations in the Variant map (no network), each of the 8 variants plus the faithful claims yields the listed verdict, concern(s) and evidence roles; V1 explanation contains "inflates"; a fictional severity pair "mild" vs "severe" yields `partially_supported` + `frequency_severity_inflation` with "understates".
 2. Decision-table tests: one per row D0-D9, each output passes 02 `check_rules` and the response schema; property test over random signal combinations never yields `supported` with a contradicting item, `contradicted` without one, `partially_supported` without a concern, or a contradicting item under `insufficient_evidence`.
-3. Ordinal tests, both directions: stronger/weaker/tie/adjacent-mixed-basis/at-least cue/bucket-0 escalation/gap-3 escalation; same-basis-first pairing; vague quantifier not flagged as understatement; rate ratio catches twice vs once a month.
+3. Ordinal tests, both directions: stronger/weaker/tie/adjacent-mixed-basis/at-least cue (minimal list)/bucket-0 escalation/gap-3 escalation; same-basis-first pairing; vague quantifier not flagged as understatement. **[OPTIONAL]** rate ratio catches twice vs once a month.
 4. Group A: reporter mismatch via speaker string and via role; role `None` turn skips A3/A9 and lands in `ambiguous_turns`; bucket 9 fires only for interviewer question turns; zero verifier calls for no-evidence and question-only claims (call counter).
 5. Dedup: V3-style item yields only `wrong_attribution`; V2 yields only `negation_reversal`; generic `unsupported_claim` absent when a specific concern exists; one concern per type.
-6. Floors: a `low` conf flag is dropped and counted; P1 flag at `medium` is emitted.
+6. Floors (fixed): a `low` conf flag is dropped and counted; P1 flag at `medium` is emitted. Calibration is **[OPTIONAL]**.
 7. Inference: all premises entail + step acceptable gives support; one failing premise or step gives `qualifying` premises and `insufficient_evidence` + `unsupported_claim`.
 8. Failure: verifier timeout, bad JSON twice, and an unjudged item after retry each stall only that claim; other claims complete; `check_claims` never raises.
 9. Neutrality and rule 9: banned-word test over all templates; no 8-gram of any test transcript and no timestamp in any explanation or revision; sentinel test shows no claim/turn text in logs.
-10. Leak test: no 8-gram overlap between `check_fewshot.json` and any eval fixture. Whole suite offline (`LLM_MODE=stub|fixture`).
+10. **[OPTIONAL]** Leak test: no 8-gram overlap between `check_fewshot.json` and any eval fixture. Whole suite offline (`LLM_MODE=stub|fixture`).

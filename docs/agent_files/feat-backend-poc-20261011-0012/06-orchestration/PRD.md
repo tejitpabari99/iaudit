@@ -26,11 +26,32 @@ Stages 02-05 are individually correct but nothing yet guarantees the product pro
 - Stage internals (02-05), prompts, model choice/benchmarks, eval scoring (07), docs pass (08).
 - Auth, rate limiting, queueing multiple concurrent audits, background jobs, streaming responses to the client, hedged/speculative duplicate calls.
 
+## Scope tiers
+Hackathon build: **Core** is the critical path and ships first. **Optional** items are gated: start only after ALL core work in every sub-project is finished. No core item depends on an optional one.
+
+**Core**
+- R1 async fan-out (prep ‖ atomize -> per-claim link -> check -> assemble), global semaphore (20), per-claim/section tasks tracked in `RunState` (no `TaskGroup`), `PIPELINE_MAX_CLAIMS`.
+- R2 deadline: 60 s `AUDIT_DEADLINE_S`, `ASSEMBLE_RESERVE_S`, `llm_deadline`, `MIN_CALL_S`, per-call timeout, `PREP_SOFT_TIMEOUT_S`, `CANCEL_GRACE_S`.
+- R3 section/claim degradation mapping and useless-result guard (nothing usable -> 503/504/500; D6).
+- R4 cancellation and partial-result semantics (write-once `RunState`, supervisor, events not `await task`, never catch `CancelledError`, `num_retries=0`).
+- R5 basic metrics only: per-stage first-start/last-end timings, claim/section counters, `deadline_hit`, one `audit_done` log line via the 01 allowlist.
+- R7 wiring: `IAUDIT_PIPELINE=stub|full` with default flipped to `full`, core `Settings` keys (all except warm-up/Server-Timing keys), `DeadlineExceeded`.
+- R8 sibling changes except cache-related ones (`single-claim` entry points, `atomize_section`, `build_link_context`/`link_one`, `check_one`, deadline-gated retries, `RequestContext.remaining()`).
+- Acceptance 1 (basic replay test on ADHD faithful + 8 variants through `FullPipeline`), 2-6, 9, and a basic version of 8 (log + counters, no sentinel text).
+- Basic deadline/cancel tests with a small injected delay (plain asyncio sleep in a stub client, tiny `AUDIT_DEADLINE_S`); no latency suite needed.
+
+**Optional (gated: after all core work in every SP)**
+- Prompt caching: R6 shared `pipeline/layout.py` cache layout, `LLMRequest.cache_prefixes`, t=0 warm-up call(s) (`warmup.py`, `CACHE_WARMUP`, `CACHE_MIN_PREFIX_TOKENS`, `WARMUP_MAX_WAIT_S`), acceptance 7, decisions D8/D9. Core fallback: 04 and 05 render their own prompts with at most the existing single `cache_prefix`, no warm-up, no cross-stage sharing.
+- Latency/load test suite (`tests/latency/`: `LatencyInjector`, scaled time, S1-S10) and live acceptance 10.
+- `RequestMetrics.snapshot()` beyond basic timings (tokens per tier, cache ratio, per-call records, `over_budget` flags, remaining ms at assemble), the sentinel-text part of acceptance 8.
+- `Server-Timing` header (R5, D12, `SERVER_TIMING`).
+- Starvation/priority handling (R1 pending-priority bullet, O-5, priority semaphore).
+
 ## Requirements
 
 ### R1 DAG and concurrency
 ```
-t0 -> prep task (rules now, cheap-LLM refine, soft timeout) ---------------+
+t0 -> prep task (rules-only `prep()`; [OPTIONAL] soft timeout) ---------------+
    -> warm-up task (best effort, R6)                                       |
    -> per section: atomize_section ──> per in-scope claim: flow ───────────┤ await prep_ready
          (OOS claims: pass-through draft, no calls)                        v
@@ -41,7 +62,7 @@ supervisor: wait until all done or llm_deadline -> cancel -> collect -> guards -
 - Caps: global LLM semaphore 20 (01) is the real limit; stage semaphores (`LINK_CONCURRENCY` 20, `CHECK_CONCURRENCY` 20) stay as 04/05 defined. Per-request claim cap `PIPELINE_MAX_CLAIMS` (default 80, ~20 typical, 3x synthetic = about 60): admission counter; a claim over the cap is not processed, `internal.truncated=true` (02 emits `input_truncated`), status stays `complete` [OPEN O-4].
 - Per-claim and per-section tasks are plain `asyncio.create_task`s tracked in `RunState`; no `TaskGroup` (one bug-induced exception would cancel siblings and lose finished work).
 - CPU-bound pieces (turn-index build, `assemble`, schema validation) run via `asyncio.to_thread` when > about 50 ms so the loop keeps serving timers and other requests.
-- Pending-priority: FIFO on the global semaphore means late-stage calls queue behind new link calls. Accepted for POC; measure in S3 [OPEN O-5].
+- **[OPTIONAL]** Pending-priority: FIFO on the global semaphore means late-stage calls queue behind new link calls. Accepted for POC; measure in S3 [OPEN O-5].
 
 ### R2 Deadline budget
 All times from `t0` = request receipt (`ctx.deadline` set by 01 = `t0 + AUDIT_DEADLINE_S`, so body parse and validation count).
@@ -61,7 +82,7 @@ Retries: client retry and 03/04/05 semantic retries are allowed only if `remaini
 | Event | Result |
 |---|---|
 | Prep chunk bad/timeout | rule fallback inside 03; no output change |
-| Prep soft timeout | rules-only `PrepResult`; continue |
+| [OPTIONAL] Prep soft timeout | rules-only `PrepResult`; continue (core: `prep()` is already rules-only, no LLM) |
 | Atomize failure (any 03 reason) or section not done at `llm_deadline` | no claims for that section; `section_failures` entry (`timeout`/`deadline` -> `timeout`; others -> `error`); 02 emits `section_not_processed` and `status: partial` (rule 11) |
 | Link stalled, check stalled, or claim unfinished at `llm_deadline` | `ClaimDraft.outcome="stalled"` (05 `stalled_draft`); 02 builds `insufficient_evidence` + `other` warning naming the claim (locked). Evidence is dropped, even if link finished |
 | Claims over `PIPELINE_MAX_CLAIMS` | omitted; `truncated=true` |
@@ -84,11 +105,12 @@ Rationale: an all-`insufficient_evidence` or empty audit reads like "nothing wro
 7. **Late race.** Results are read from `RunState` after the cancel wait; a claim that finished at the buzzer counts.
 
 ### R5 Instrumentation
-- `RequestMetrics` (extends 01 `MetricsCollector`): per call `{call_tag, tier, model, unit (section index or claim id), in/out/cache_read/cache_write tokens, latency_ms, attempts, ok, error_kind}`; per stage span `{first_start_ms, last_end_ms, calls, over_budget}` relative to `t0`; counters: sections (ok/failed by reason), claims (in/out of scope, ok, stalled by reason, truncated), prep (unsure turns, degraded chunks), cancelled tasks, `deadline_hit`, remaining ms at assemble, cache hit ratio `cache_read / (input + cache_read)`, assemble report counts (02). `snapshot() -> dict` is JSON-able, text-free; 07 reads `ctx.metrics.snapshot()` after `run`.
+- Core: per-stage spans (first start, last end), claim/section counters, `deadline_hit`, `audit_done` log line. **[OPTIONAL]** the rest of this bullet: `RequestMetrics` (extends 01 `MetricsCollector`): per call `{call_tag, tier, model, unit (section index or claim id), in/out/cache_read/cache_write tokens, latency_ms, attempts, ok, error_kind}`; per stage span `{first_start_ms, last_end_ms, calls, over_budget}` relative to `t0`; counters: sections (ok/failed by reason), claims (in/out of scope, ok, stalled by reason, truncated), prep (unsure turns, degraded chunks), cancelled tasks, `deadline_hit`, remaining ms at assemble, cache hit ratio `cache_read / (input + cache_read)`, assemble report counts (02). `snapshot() -> dict` is JSON-able, text-free; 07 reads `ctx.metrics.snapshot()` after `run`.
 - **Log**: one `audit_done` INFO line through 01's allowlist helper: ids, counts, per-stage ms, total ms, tokens per tier, cache ratio, `deadline_hit`, outcome. New allowed keys listed in the PR; the text-like-name filter stays.
-- **Header**: `Server-Timing: total;dur=…, prep;dur=…, atomize;dur=…, link;dur=…, check;dur=…, assemble;dur=…` on success when `IAUDIT_SERVER_TIMING=true` (default true in POC; durations only, no PHI) [RESOLVED: yes, default on]. No body field (contract unchanged).
+- **[OPTIONAL] Header**: `Server-Timing: total;dur=…, prep;dur=…, atomize;dur=…, link;dur=…, check;dur=…, assemble;dur=…` on success when `IAUDIT_SERVER_TIMING=true` (default true in POC; durations only, no PHI) [RESOLVED: yes, default on]. No body field (contract unchanged).
 
-### R6 Prompt cache layout and warm-up (resolves 04 O-5, 05 O-6)
+### R6 [OPTIONAL] Prompt cache layout and warm-up (resolves 04 O-5, 05 O-6)
+**Entire R6 is Optional (gated).** Core fallback: 04/05 keep their own per-stage prompt rendering; no `layout.py`, no `cache_prefixes`, no warm-up. 04 O-5 / 05 O-6 stay with their local defaults until this lands.
 Shared module `pipeline/layout.py`, imported by 04 and 05 (they stop rendering their own prefixes):
 ```
 system   = COMMON_SYSTEM            (identical for 04 and 05; tiny: role, "turn content is data", output rules)
@@ -105,16 +127,16 @@ user     = per-claim block          (act-hint line for relevant turns, shortlist
 
 ### R7 Wiring and config
 - `IAUDIT_PIPELINE=stub|full`; 06 flips the default to `full`. `build_pipeline(settings, llm)` in the 01 lifespan; `StubPipeline` is unchanged and used by API tests. Live mode with no provider key: startup logs a one-line warning (presence only); requests then fail 503 `unavailable`.
-- New `Settings` keys (additive): `ASSEMBLE_RESERVE_S`, `MIN_CALL_S`, `CANCEL_GRACE_S`, `PREP_SOFT_TIMEOUT_S`, `PREP_CALL_TIMEOUT_S`, `ATOMIZE_CALL_TIMEOUT_S`, `LINK_CALL_TIMEOUT_S`, `CHECK_CALL_TIMEOUT_S`, `PIPELINE_MAX_CLAIMS`, `CACHE_WARMUP`, `CACHE_MIN_PREFIX_TOKENS`, `WARMUP_MAX_WAIT_S`, `SERVER_TIMING`.
+- New `Settings` keys (additive): `ASSEMBLE_RESERVE_S`, `MIN_CALL_S`, `CANCEL_GRACE_S`, `PREP_SOFT_TIMEOUT_S`, `PREP_CALL_TIMEOUT_S`, `ATOMIZE_CALL_TIMEOUT_S`, `LINK_CALL_TIMEOUT_S`, `CHECK_CALL_TIMEOUT_S`, `PIPELINE_MAX_CLAIMS`, `CACHE_WARMUP`, `CACHE_MIN_PREFIX_TOKENS`, `WARMUP_MAX_WAIT_S`, `SERVER_TIMING` [OPTIONAL]; `CACHE_WARMUP`, `CACHE_MIN_PREFIX_TOKENS`, `WARMUP_MAX_WAIT_S` are [OPTIONAL] (R6).
 - Exceptions: `DeadlineExceeded` (504 `unavailable`, same mapping as 01's backstop); `LLMUnavailable` (503). The 01 backstop `asyncio.timeout(D + grace)` stays as the last line of defence (expected unreachable).
 
 ### R8 Interface changes requested of sibling SPs
 | SP | Change |
 |---|---|
-| 01 | `LLMRequest.cache_prefixes`; retry gated on `deadline`; LiteLLM `num_retries=0`; `RequestContext`: `remaining()`, `call_timeout(stage)` (None if under `MIN_CALL_S`), `fixture_scope` (request_id) so stages pass `fixture_key` (07 O-6); metrics `unit` + span API + `snapshot()`; log allowlist keys; `Server-Timing`; `DeadlineExceeded` mapping |
-| 03 | `atomize_section(section, roster, ctx) -> SectionAtoms` (batch fn becomes a gather wrapper); `prep_rules_only(turns) -> PrepResult` |
-| 04 | `build_link_context(turns, prep, ctx)` (TurnIndex + mode, once) and `link_one(claim, lctx, ctx) -> LinkResult`; use `layout.py`; drop built-in warm-up |
-| 05 | `check_one(claim, link, prep, turns, ctx) -> ClaimDraft`, `stalled_draft(claim, reason)`, `passthrough_oos(claim)`; use `layout.py` |
+| 01 | `LLMRequest.cache_prefixes` [OPTIONAL]; retry gated on `deadline`; LiteLLM `num_retries=0`; `RequestContext`: `remaining()`, `call_timeout(stage)` (None if under `MIN_CALL_S`), `fixture_scope` (request_id) so stages pass `fixture_key` (07 O-6); metrics `unit` + span API + `snapshot()`; log allowlist keys; `Server-Timing` [OPTIONAL]; `DeadlineExceeded` mapping |
+| 03 | `atomize_section(section, roster, ctx) -> SectionAtoms` (batch fn becomes a gather wrapper); `prep(turns) -> PrepResult` (rules-only, no LLM) |
+| 04 | `build_link_context(turns, prep, ctx)` (TurnIndex + mode, once) and `link_one(claim, lctx, ctx) -> LinkResult`; use `layout.py` and drop built-in warm-up [both OPTIONAL] |
+| 05 | `check_one(claim, link, prep, turns, ctx) -> ClaimDraft`, `stalled_draft(claim, reason)`, `passthrough_oos(claim)`; use `layout.py` [OPTIONAL] |
 | 02 | none; 06 supplies `InternalAudit(claims, section_failures, truncated)` |
 | 07 | e2e adapter = `FullPipeline.run` + `ctx.metrics.snapshot()` |
 [Applied 2026-10-11: R8 asks written into 01, 03, 04, 05 PRDs; 02/07 need none. Conflicts noted as [OPEN] in 01 (O-5) and 04 (O-10).]
@@ -140,11 +162,11 @@ Typical ADHD timeline [estimate, live mid-tier]: atomize 4-7 s; links from about
 | D5 | Shared waits | Events, not `await task` | Await prep task | Awaiter cancel would cancel prep for everyone |
 | D6 | Nothing usable | 503/504 `unavailable` (guard) | 200 partial, all sections not processed | Empty audit looks clean; error is retryable [OPEN O-1] |
 | D7 | Claim stall status | Stays `complete` with `other` warnings | Escalate to partial | Rule 11 ties partial to `section_not_processed`; locked rule |
-| D8 | Cache layout | Common system -> transcript -> stage -> claim, acts out of the prefix | Per-stage prefixes (04/05 default) | One transcript write shared by both stages; prefix known at t=0 |
-| D9 | Warm-up | t=0 tiny calls during atomize | Serialize first link call (04) | Zero added latency; Link budget untouched |
+| D8 [OPTIONAL] | Cache layout | Common system -> transcript -> stage -> claim, acts out of the prefix | Per-stage prefixes (04/05 default) | One transcript write shared by both stages; prefix known at t=0 |
+| D9 [OPTIONAL] | Warm-up | t=0 tiny calls during atomize | Serialize first link call (04) | Zero added latency; Link budget untouched |
 | D10 | Prep gating | Soft timeout to rules-only | Wait for LLM refinement | Prep is a hint source, never a blocker |
 | D11 | Over-cap claims | Omit + `input_truncated` | Stall them | Fabricating `insufficient_evidence` for unprocessed claims misleads [OPEN O-4] |
-| D12 | Timing header | `Server-Timing`, default on | Debug body field; none | No contract change, no PHI, visible in devtools |
+| D12 [OPTIONAL] | Timing header | `Server-Timing`, default on | Debug body field; none | No contract change, no PHI, visible in devtools |
 | D13 | Hedged duplicate calls | Not in POC | Hedge slowest calls | Cost and cap pressure; revisit with p95 data |
 | D14 | Cap vs client timeout | Keep 60 s | Raise to about 90 s | Locked product target; configurable, startup guard < 100 |
 
@@ -166,19 +188,20 @@ Typical ADHD timeline [estimate, live mid-tier]: atomize 4-7 s; links from about
 - [RESOLVED: Server-Timing header, default on].
 
 ## Acceptance Criteria
-Scaled-time tests (R-test below) unless stated; all offline.
+All offline. Core tests use a small injected delay and tiny deadline in stub/fixture clients; the full scaled-time suite below is **[OPTIONAL]**.
 1. Stub/fixture full pipeline on the ADHD faithful + 8 variants returns the 07 expected verdicts/concerns through `FullPipeline` (not stub), response valid against the schema, `request_id` echoed.
 2. Streaming: with two sections where B atomizes slowly, A's first link call starts before B's atomize ends; peak in-flight LLM calls <= 20.
 3. Failure maps: one link timeout -> that claim `insufficient_evidence` + `other` warning naming it, status `complete`; one atomize failure -> `section_not_processed` + `partial`, other sections intact.
 4. Deadline: inflated latencies make check overrun; response returns within `AUDIT_DEADLINE_S` (+0.5 s scaled), finished claims keep real verdicts, unfinished get the stall rule, `deadline_hit=true`, no leaked tasks (`asyncio.all_tasks()` equals baseline), semaphore value restored.
 5. Shared-task trap test: cancelling one claim flow does not cancel prep or sibling flows.
 6. Guard: all calls `LLMUnavailable` -> 503; all timeouts -> 504; unexpected exception everywhere -> 500; all-out-of-scope assessment -> 200.
-7. Cache layout: link and check requests in whole mode share byte-identical `system` + transcript prefix; the warm-up request prefix equals it; a prefix-cache fake shows hit ratio above 0.8 on the 3x run and below that with warm-up off; short transcripts skip warm-up; fixture mode never warms up.
-8. Metrics: `snapshot()` has stage spans, tokens, cache ratio, counters, `deadline_hit`; log line and `Server-Timing` present; sentinel text never appears in logs, metrics or header.
+7. **[OPTIONAL]** Cache layout: link and check requests in whole mode share byte-identical `system` + transcript prefix; the warm-up request prefix equals it; a prefix-cache fake shows hit ratio above 0.8 on the 3x run and below that with warm-up off; short transcripts skip warm-up; fixture mode never warms up.
+8. Metrics: core = stage spans, counters, `deadline_hit` and `audit_done` log line present. **[OPTIONAL]** `snapshot()` with tokens, cache ratio; `Server-Timing` present; sentinel text never appears in logs, metrics or header.
 9. Config: `IAUDIT_PIPELINE=stub` serves `StubPipeline`; default serves `FullPipeline`; D > 100 warns at startup.
-10. Live (opt-in, owner key): ADHD e2e p50/p95 over 5 runs recorded in the report; target p95 < 45 s; cache_read > 0 on an above-minimum transcript.
+10. **[OPTIONAL]** Live (opt-in, owner key): ADHD e2e p50/p95 over 5 runs recorded in the report; target p95 < 45 s; cache_read > 0 on an above-minimum transcript.
 
-## Latency / load test plan (`tests/latency/`)
+## [OPTIONAL] Latency / load test plan (`tests/latency/`)
+Entire section is Optional (gated). Core uses the small injected-delay tests in Acceptance Criteria instead.
 - **Harness**: `LatencyInjector(inner)` wraps `FixtureClient`/`StubClient`; per `call_tag` lognormal latency (p50/p95 start: prep 1.5/3, atomize 5/9, link 4/8, check 4/8 s), failure injection (timeout, unavailable, bad output by rate or by unit id), records start/end per call. **Scaled time**: `AUDIT_DEADLINE_S`, reserve, caps and latencies all multiplied by one factor (default 1/50), so 60 s becomes 1.2 s and ratios hold; no new dependency. Nightly/opt-in run at factor 1.
 - S1 ADHD faithful + 8 variants with injected latencies (total, per-stage spans vs soft budgets).
 - S2 section skew (pipelining proof). S3 3x synthetic long transcript (generated from a fictional "Jordan" template, about 78 turns, about 60 claims; not ADHD or CDR text): total vs 45 s, peak concurrency, FIFO starvation, token totals. S4 failure injection matrix (link/check/atomize/prep). S5 deadline overrun. S6 outage matrix (guard). S7 cancellation hygiene (CancelledError delivery, semaphore, leaked tasks, shared-task trap). S8 cache simulation. S9 metrics/log hygiene.

@@ -25,6 +25,13 @@ LLM stages cannot be trusted to emit offsets or to keep verdict, evidence and co
 - LLM rewriting of text that fails the rule 9 check (parked, see O-5).
 - Searching outside the cited turn(s) (see D-3). HTTP, error bodies (SP01), timeouts and parallelism (SP06).
 
+## Scope tiers
+**Core** (must ship): R1 locator (exact, normalized, guarded fuzzy, ellipsis, hint), R2 evidence resolution and span/cross-turn rules, R3 claim resolution with overlap policy for nested and identical spans (partial overlap: drop the less severe claim, see fallback), R4 repair table rows 1-12 (rules 1-12), R5 reduced rule 9 check (quoted span of 4+ words, timestamp patterns, drop `note` fields that are exact substrings of a turn text, `suggested_revision` null and fixed fallback text on violation), R6 warnings/status, R7 final validation and schema check, D-1 to D-7, D-10, D-11, O-8. Matching acceptance criteria.
+
+**Optional (gated: after all core work in every SP)**:
+- [OPTIONAL] Rule 9 8-gram copy check (R5, D-9, O-3). Core fallback: strip `note` fields that are exact substrings of turn text; the quoted-span and timestamp checks stay core.
+- [OPTIONAL] Partial-overlap trimming finesse (R3 overlap policy, D-8 trim part). Core fallback: drop the less severe overlapping claim and add an `other` warning with `claim_id`.
+
 ## Requirements
 
 **Internal input model (ASSUMPTION: SP03/04/05 produce exactly this; SP06 assembles it). Pydantic models in `assembler/models.py`:**
@@ -59,7 +66,7 @@ Entry point: `assemble(request, internal, cfg) -> AssembleOutcome(response: dict
 - **Overlap policy (rule 8), applied per section after location:**
   - Nested: drop the outer, keep the narrower claims (finer atomic claims; gaps are legal).
   - Identical span: keep the more severe verdict (contradicted > partially_supported > insufficient_evidence > supported > out_of_scope); tie: first.
-  - Partial overlap: trim the less severe claim's overlapping end; if fewer than 3 non-space chars remain, drop it.
+  - Partial overlap: drop the less severe claim (tie: the later one) and add a warning. [OPTIONAL: trim the less severe claim's overlapping end instead; if fewer than 3 non-space chars remain, drop it.]
   - Every drop or trim adds one `other` warning with `claim_id`.
 
 **R4 Rule enforcement and repair.** Runs per claim after R2, in this order; each repair appends a code to the report and, when the verdict changes, replaces `explanation` with a fixed template (the old explanation described evidence that no longer exists) and adds an `other` warning with `claim_id`.
@@ -77,9 +84,10 @@ Entry point: `assemble(request, internal, cfg) -> AssembleOutcome(response: dict
 | Rule 7 | Concern `evidence_ids` filtered to this claim's final ids; deduped |
 
 **R5 Rule 9 copy check** (`copycheck.py`), applied to `explanation`, concern explanations, `note`, `suggested_revision`, `out_of_scope_reason`, warning messages:
-- Violation = any word 8-gram (lowercased, NFKC, punctuation stripped) shared with any transcript turn and NOT present in the assessment text (assessor's own words are allowed); or a quoted span of 4+ words found in the transcript; or any request `timestamp` string / `\d\d:\d\d` pattern.
+- Core violation = a quoted span of 4+ words found in the transcript; or any request `timestamp` string / `\d\d:\d\d` pattern; or a `note` that is an exact substring of any turn text (note dropped).
+- [OPTIONAL] Additional violation = any word 8-gram (lowercased, NFKC, punctuation stripped) shared with any transcript turn and NOT present in the assessment text (assessor's own words are allowed).
 - Repair: `note` dropped; `suggested_revision` set to null; a violating explanation/reason loses the offending sentences; if nothing is left use the fixed per-verdict (or per-concern-type) fallback text plus an `other` warning.
-- Transcript n-gram set built once per request.
+- [OPTIONAL] Transcript n-gram set built once per request (8-gram check only).
 
 **R6 Warnings, status.** Order: section warnings, claim warnings in claim order, then aggregates.
 - `section_not_processed` + `section_index`: from `section_failures` and R3.
@@ -109,8 +117,8 @@ Modules: `models.py`, `normalize.py` + `locate.py`, `claims.py`, `evidence.py`, 
 | D-5 | Cross-turn merge | Merge only when walk adds no extra text; else split | Always merge | Walk includes whole first turn tail and last turn head; over-inclusion would highlight text the linker never cited |
 | D-6 | Dropped evidence | Downgrade verdict conservatively with fixed template text | Keep verdict; ask LLM to redo | Never leave a verdict with no visible basis; pure Python; old explanation would be stale |
 | D-7 | Never upgrade to `supported` or invent concerns | Repairs only move toward `insufficient_evidence` (or contradicted per rule 5) | Re-derive verdict | Assembler has no meaning judgement |
-| D-8 | Overlap | Keep narrower; severity wins ties; trim partial overlaps | Merge claims; drop later | Finest-grained claims serve the reviewer; problems must not be hidden |
-| D-9 | Rule 9 check | 8-gram vs transcript minus assessment words, quote and timestamp checks; strip, no rewrite | Embedding similarity; LLM rewrite | Cheap, deterministic, low false positives |
+| D-8 | Overlap | Keep narrower; severity wins ties; partial overlap drops the less severe claim [OPTIONAL: trim instead of drop] | Merge claims; drop later | Finest-grained claims serve the reviewer; problems must not be hidden |
+| D-9 | Rule 9 check | Core: quote and timestamp checks plus exact-substring `note` drop; [OPTIONAL: 8-gram vs transcript minus assessment words]; strip, no rewrite | Embedding similarity; LLM rewrite | Cheap, deterministic, low false positives |
 | D-10 | Validation failure | Quarantine bad claims once, else `internal_error` | Return best effort | Consumer rejects invalid bodies and must not render half an audit |
 | D-11 | Ids | Assembler assigns `cN` / `eN` | Pass through checker ids | Guarantees rule 7 uniqueness |
 
@@ -118,7 +126,7 @@ Modules: `models.py`, `normalize.py` + `locate.py`, `claims.py`, `evidence.py`, 
 - O-8 [RESOLVED: `ClaimDraft` uses SP03 `segments` + `span_hint`; `locate()` is the only matcher; SP03 passes hints located via `locate()`, 02 re-verifies and falls back] Alignment with SP03 O-1 / SP07 O-14.
 - O-1 [OPEN] Fuzzy threshold (90), `fuzzy_min_len` (12) and window ratio are guesses. Tune on the ADHD fixtures plus recorded linker output: report per-tier hit rate and false-match rate; pick the lowest threshold with zero wrong-turn/wrong-text matches.
 - O-2 [OPEN] `cross_turn_slack` default 0: may split Q+"yes" evidence too often when the linker trims trailing punctuation. Check split rate in linked-mode runs.
-- O-3 [OPEN] Rule 9 n-gram size 8 and quote length 4: tune against false positives on short transcripts (idiomatic phrases) and misses on paraphrase-lite explanations.
+- O-3 [OPEN] [OPTIONAL] Rule 9 n-gram size 8 and quote length 4: tune against false positives on short transcripts (idiomatic phrases) and misses on paraphrase-lite explanations.
 - O-4 [RESOLVED: 05 never emits `supported` with a contradicting item; mixed support+contradiction = `partially_supported` + specific concern, per 05 decision table D5/D8, matching this repair] Repair for rule 2 violation (supported plus contradicting) is `partially_supported`; SP05 should never emit it, so confirm with SP05 whether to prefer `contradicted`.
 - O-5 [DEFERRED] LLM rewrite of rule-9 violators and relocating evidence outside the cited turn: only if drop-rate in benchmark justifies.
 - O-6 [DEFERRED] Lone surrogates / grapheme clusters in request text; NFKC per char differs from whole-string NFKC for combining sequences (match-only impact).
@@ -131,8 +139,8 @@ Modules: `models.py`, `normalize.py` + `locate.py`, `claims.py`, `evidence.py`, 
 - Unit tests, no network, cover: exact; case/whitespace/curly-quote variant mapped to original offsets; length-changing normalization (ß, NFKC ligature, multiple spaces); ellipsis excerpt; repeated phrase picks hint then first; emoji before the match keeps code-point offsets; fuzzy accepts a typo and rejects "once" vs "twice" and "did not" vs "did"; unmatched excerpt dropped.
 - Cross-turn: merged span never ends at `char: 0`; non-adjacent or partial-turn segments split into separate items.
 - One test per repair row in R4 asserts the resulting verdict/concerns pass the real schema and `check_rules`; none ever yields `supported` from a lower verdict.
-- Overlap tests: nested, identical, partial; resulting claim spans never overlap or nest.
-- Rule 9: an 8+ word verbatim transcript run in `explanation` is stripped or replaced; a `note` is dropped; `suggested_revision` becomes null; assessor-only phrases pass; timestamps are caught.
+- Overlap tests: nested, identical, partial (core: less severe claim dropped with warning; [OPTIONAL] trimmed to non-overlapping remainder); resulting claim spans never overlap or nest.
+- Rule 9: a quoted 4+ word transcript span in `explanation` is stripped or replaced; a `note` that is an exact substring of a turn is dropped; [OPTIONAL] an 8+ word verbatim transcript run in `explanation` is stripped or replaced; `suggested_revision` becomes null; assessor-only phrases pass; timestamps are caught.
 - Warnings: failed section yields `section_not_processed` + `section_index` and status `partial`; no failures yields `complete`; `request_id` echoed or omitted; missing-role claim yields `ambiguous_speaker`.
 - A forced schema failure raises `AssemblyError`; a single bad claim is quarantined with a warning and the rest returns.
 - `report` and logs contain counts and ids only (test greps outputs for a canary transcript string).
